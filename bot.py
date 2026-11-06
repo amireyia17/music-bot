@@ -37,7 +37,9 @@ if YANDEX_TOKEN:
     except Exception as e:
         logger.error(f"Ошибка Яндекс.Музыки: {e}")
 
+# user_id -> {"results": [...], "page": 0}
 search_cache = {}
+PAGE_SIZE = 3
 
 def format_duration(ms: int) -> str:
     if not ms:
@@ -46,7 +48,7 @@ def format_duration(ms: int) -> str:
     m, s = divmod(sec, 60)
     return f"{m}:{s:02d}"
 
-async def search_yandex(query: str, limit: int = 15):
+async def search_yandex(query: str, limit: int = 30):
     if not ym_client:
         return []
     try:
@@ -87,7 +89,7 @@ async def download_yandex(track_id: str) -> str | None:
         logger.error(f"Ошибка скачивания Яндекс: {e}")
         return None
 
-async def search_soundcloud(query: str, limit: int = 8):
+async def search_soundcloud(query: str, limit: int = 10):
     ydl_opts = {
         "quiet": True,
         "no_warnings": True,
@@ -186,11 +188,31 @@ def main_keyboard():
         resize_keyboard=True
     )
 
-def build_results(results: list, user_id: int):
+def build_page(user_id: int, page: int):
+    data = search_cache.get(user_id)
+    if not data:
+        return None, None
+
+    results = data["results"]
+    total = len(results)
+    total_pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
+
+    if page < 0:
+        page = 0
+    if page >= total_pages:
+        page = total_pages - 1
+
+    data["page"] = page
+    start = page * PAGE_SIZE
+    end = start + PAGE_SIZE
+    page_tracks = results[start:end]
+
+    # Текст в стиле скриншота
     lines = []
     buttons = []
 
-    for i, track in enumerate(results[:12]):
+    for i, track in enumerate(page_tracks):
+        global_index = start + i
         duration = format_duration(track.get("duration", 0))
         title = track["title"]
         artists = track["artists"]
@@ -200,12 +222,35 @@ def build_results(results: list, user_id: int):
             f"{duration} · {artists}"
         )
 
+        # Кнопка с названием трека (кликабельное название)
+        btn_text = f"«{title}»"
+        if len(btn_text) > 60:
+            btn_text = btn_text[:57] + "…»"
+
         buttons.append([
             InlineKeyboardButton(
-                text=f"{i + 1}. {title[:45]}{'…' if len(title) > 45 else ''}",
-                callback_data=f"dl:{user_id}:{i}"
+                text=btn_text,
+                callback_data=f"dl:{user_id}:{global_index}"
             )
         ])
+
+    # Кнопки пагинации
+    nav_buttons = []
+    if page > 0:
+        nav_buttons.append(
+            InlineKeyboardButton(text="◀️ Назад", callback_data=f"page:{user_id}:{page - 1}")
+        )
+
+    nav_buttons.append(
+        InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="noop")
+    )
+
+    if page < total_pages - 1:
+        nav_buttons.append(
+            InlineKeyboardButton(text="Вперёд ▶️", callback_data=f"page:{user_id}:{page + 1}")
+        )
+
+    buttons.append(nav_buttons)
 
     text = "\n\n".join(lines)
     keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
@@ -221,8 +266,9 @@ async def cmd_start(message: Message):
 @dp.message(Command("help"))
 async def cmd_help(message: Message):
     await message.answer(
-        "Просто напиши название песни.\n"
-        "Потом нажми на нужный трек в списке.",
+        "Напиши название песни.\n"
+        "Появятся 3 трека — нажми на название, чтобы скачать.\n"
+        "Листай страницы кнопками внизу.",
         reply_markup=main_keyboard()
     )
 
@@ -231,7 +277,7 @@ async def menu_buttons(message: Message):
     if message.text == "Песни":
         await message.answer("Напиши название трека или исполнителя")
     else:
-        await message.answer("Сначала найди трек — напиши название, потом выбери из списка")
+        await message.answer("Сначала найди трек — напиши название, потом нажми на нужный")
 
 @dp.message(F.text)
 async def handle_query(message: Message):
@@ -272,16 +318,50 @@ async def handle_query(message: Message):
 
     yandex_results = await search_yandex(query)
     sc_results = await search_soundcloud(query)
-    all_results = yandex_results[:10] + sc_results[:5]
+
+    # Яндекс обычно отдаёт более релевантные сверху
+    all_results = yandex_results[:20] + sc_results[:10]
 
     if not all_results:
         await status.edit_text("Ничего не найдено")
         return
 
-    search_cache[user_id] = all_results
-    text, keyboard = build_results(all_results, user_id)
+    search_cache[user_id] = {
+        "results": all_results,
+        "page": 0
+    }
 
+    text, keyboard = build_page(user_id, 0)
     await status.edit_text(text, reply_markup=keyboard)
+
+@dp.callback_query(F.data == "noop")
+async def noop_callback(callback: CallbackQuery):
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("page:"))
+async def on_page_callback(callback: CallbackQuery):
+    try:
+        _, user_id_str, page_str = callback.data.split(":")
+        user_id = int(user_id_str)
+        page = int(page_str)
+    except Exception:
+        await callback.answer("Ошибка", show_alert=True)
+        return
+
+    if callback.from_user.id != user_id:
+        await callback.answer("Это не твой поиск", show_alert=True)
+        return
+
+    text, keyboard = build_page(user_id, page)
+    if text is None:
+        await callback.answer("Результаты устарели, поищи заново", show_alert=True)
+        return
+
+    await callback.answer()
+    try:
+        await callback.message.edit_text(text, reply_markup=keyboard)
+    except Exception:
+        pass
 
 @dp.callback_query(F.data.startswith("dl:"))
 async def on_download_callback(callback: CallbackQuery):
@@ -297,17 +377,20 @@ async def on_download_callback(callback: CallbackQuery):
         await callback.answer("Это не твой поиск", show_alert=True)
         return
 
-    results = search_cache.get(user_id)
-    if not results or index >= len(results):
+    data = search_cache.get(user_id)
+    if not data:
         await callback.answer("Результаты устарели, поищи заново", show_alert=True)
+        return
+
+    results = data["results"]
+    if index >= len(results):
+        await callback.answer("Трек не найден", show_alert=True)
         return
 
     track = results[index]
     await callback.answer()
 
-    status = await callback.message.answer(
-        f"Скачиваю «{track['title']}»..."
-    )
+    status = await callback.message.answer(f"Скачиваю «{track['title']}»...")
 
     path = None
     if track["source"] == "yandex":
@@ -326,10 +409,6 @@ async def on_download_callback(callback: CallbackQuery):
             track["artists"],
             source
         )
-        try:
-            await callback.message.edit_reply_markup(reply_markup=None)
-        except Exception:
-            pass
     else:
         await status.edit_text("Не удалось скачать этот трек")
 
