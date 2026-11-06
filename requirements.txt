@@ -1,0 +1,6 @@
+aiogram==3.13.1
+yandex-music==2.2.0
+yt-dlp
+python-dotenv
+aiohttp
+aiofiles
