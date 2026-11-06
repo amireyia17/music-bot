@@ -166,7 +166,7 @@ async def send_track(message: Message, path: str, title: str, artists: str, sour
 async def cmd_start(message: Message):
     await message.answer(
         "Музыкальный бот\n\n"
-        "Напиши название трека или исполнителя.\n
+        "Напиши название трека или исполнителя"
     )
 
 @dp.message(Command("help"))
