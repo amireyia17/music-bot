@@ -5,7 +5,7 @@ import logging
 from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, FSInputFile
+from aiogram.types import Message, FSInputFile, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.filters import CommandStart, Command
 from dotenv import load_dotenv
 import yt_dlp
@@ -33,7 +33,16 @@ if YANDEX_TOKEN:
     except Exception as e:
         logger.error(f"Ошибка Яндекс.Музыки: {e}")
 
-async def search_yandex(query: str, limit: int = 5):
+search_cache = {}
+
+def format_duration(ms: int) -> str:
+    if not ms:
+        return ""
+    sec = ms // 1000
+    m, s = divmod(sec, 60)
+    return f"{m}:{s:02d}"
+
+async def search_yandex(query: str, limit: int = 8):
     if not ym_client:
         return []
     try:
@@ -42,11 +51,15 @@ async def search_yandex(query: str, limit: int = 5):
             return []
         results = []
         for track in search.tracks.results[:limit]:
+            duration = getattr(track, "duration_ms", 0) or 0
+            if duration and duration < 30000:
+                continue
             artists = ", ".join(a.name for a in track.artists) if track.artists else "Unknown"
             results.append({
                 "title": track.title or "Unknown",
                 "artists": artists,
-                "id": track.id,
+                "id": str(track.id),
+                "duration": duration,
                 "source": "yandex"
             })
         return results
@@ -86,13 +99,17 @@ async def search_soundcloud(query: str, limit: int = 5):
                 for entry in info["entries"][:limit]:
                     if not entry:
                         continue
-                    url = entry.get("url") or entry.get("webpage_url") or entry.get("id")
-                    if url and not str(url).startswith("http"):
-                        url = f"https://soundcloud.com/{url}"
+                    url = entry.get("webpage_url") or entry.get("url")
+                    if not url:
+                        continue
+                    duration = entry.get("duration")
+                    duration_ms = int(duration * 1000) if duration else 0
                     results.append({
                         "title": entry.get("title") or "Unknown",
-                        "artists": entry.get("uploader") or entry.get("creator") or "Unknown",
+                        "artists": entry.get("uploader") or "Unknown",
                         "url": url,
+                        "id": str(entry.get("id", "")),
+                        "duration": duration_ms,
                         "source": "soundcloud"
                     })
             return results
@@ -112,7 +129,6 @@ async def download_soundcloud(url: str) -> str | None:
         "noprogress": True,
     }
 
-    # Пробуем с конвертацией в mp3 (нужен ffmpeg)
     ydl_opts_mp3 = {
         **ydl_opts,
         "postprocessors": [{
@@ -131,9 +147,8 @@ async def download_soundcloud(url: str) -> str | None:
                     if f.suffix.lower() in {".mp3", ".m4a", ".webm", ".opus", ".ogg"}:
                         return str(f)
     except Exception as e:
-        logger.warning(f"SoundCloud mp3 failed, trying raw: {e}")
+        logger.warning(f"SoundCloud mp3 failed: {e}")
 
-    # Запасной вариант — без конвертации
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
@@ -162,22 +177,53 @@ async def send_track(message: Message, path: str, title: str, artists: str, sour
         except OSError:
             pass
 
+def build_results_text_and_keyboard(results: list, user_id: int, query: str):
+    lines = [f"Результаты по запросу: <b>{query}</b>\n"]
+    buttons = []
+
+    for i, track in enumerate(results[:6]):
+        num = i + 1
+        duration = format_duration(track.get("duration", 0))
+        duration_str = f" · {duration}" if duration else ""
+
+        # Строка в стиле скриншота
+        lines.append(
+            f"<b>{num}.</b> 🎵 <b>{track['title']}</b>\n"
+            f"      {track['artists']}{duration_str}"
+        )
+
+        btn_text = f"{num}. {track['title'][:40]}"
+        if len(track['title']) > 40:
+            btn_text = btn_text[:37] + "..."
+
+        buttons.append([
+            InlineKeyboardButton(
+                text=btn_text,
+                callback_data=f"dl:{user_id}:{i}"
+            )
+        ])
+
+    text = "\n\n".join(lines)
+    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+    return text, keyboard
+
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
     await message.answer(
         "Музыкальный бот\n\n"
-        "Напиши название трека или исполнителя"
+        "Напиши название трека или исполнителя.\n"
+        "Я покажу список — нажми на нужный."
     )
 
 @dp.message(Command("help"))
 async def cmd_help(message: Message):
-    await message.answer("Просто отправь название песни или ссылку.")
+    await message.answer("Отправь название песни, потом выбери нужный вариант из списка.")
 
 @dp.message(F.text)
 async def handle_query(message: Message):
     query = message.text.strip()
+    user_id = message.from_user.id
 
-    # Прямая ссылка SoundCloud
     if "soundcloud.com" in query.lower():
         status = await message.answer("Скачиваю с SoundCloud...")
         path = await download_soundcloud(query)
@@ -188,7 +234,6 @@ async def handle_query(message: Message):
             await status.edit_text("Не удалось скачать с SoundCloud")
         return
 
-    # Прямая ссылка Яндекс
     if "music.yandex." in query and ym_client:
         status = await message.answer("Скачиваю с Яндекс.Музыки...")
         try:
@@ -209,37 +254,73 @@ async def handle_query(message: Message):
         await status.edit_text("Не удалось скачать")
         return
 
-    # Поиск
-    status = await message.answer(f"Ищу: {query}")
+    status = await message.answer(f"Ищу: <b>{query}</b>...", parse_mode="HTML")
 
     yandex_results = await search_yandex(query)
     sc_results = await search_soundcloud(query)
 
-    if not yandex_results and not sc_results:
+    all_results = yandex_results[:5] + sc_results[:3]
+
+    if not all_results:
         await status.edit_text("Ничего не найдено")
         return
 
-    # Сначала Яндекс
-    if yandex_results:
-        track = yandex_results[0]
-        await status.edit_text(f"Скачиваю: {track['artists']} — {track['title']}")
-        path = await download_yandex(str(track["id"]))
-        if path and os.path.exists(path):
-            await status.delete()
-            await send_track(message, path, track["title"], track["artists"], "Яндекс.Музыка")
-            return
+    search_cache[user_id] = all_results
 
-    # Потом SoundCloud
-    if sc_results:
-        track = sc_results[0]
-        await status.edit_text(f"Скачиваю: {track['artists']} — {track['title']}")
+    text, keyboard = build_results_text_and_keyboard(all_results, user_id, query)
+    await status.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
+
+@dp.callback_query(F.data.startswith("dl:"))
+async def on_download_callback(callback: CallbackQuery):
+    try:
+        _, user_id_str, index_str = callback.data.split(":")
+        user_id = int(user_id_str)
+        index = int(index_str)
+    except Exception:
+        await callback.answer("Ошибка", show_alert=True)
+        return
+
+    if callback.from_user.id != user_id:
+        await callback.answer("Это не твой поиск", show_alert=True)
+        return
+
+    results = search_cache.get(user_id)
+    if not results or index >= len(results):
+        await callback.answer("Результаты устарели, поищи заново", show_alert=True)
+        return
+
+    track = results[index]
+    await callback.answer()
+
+    status = await callback.message.answer(
+        f"Скачиваю: <b>{track['artists']}</b> — <b>{track['title']}</b>...",
+        parse_mode="HTML"
+    )
+
+    path = None
+    source_name = "Яндекс.Музыка"
+
+    if track["source"] == "yandex":
+        path = await download_yandex(track["id"])
+    else:
         path = await download_soundcloud(track["url"])
-        if path and os.path.exists(path):
-            await status.delete()
-            await send_track(message, path, track["title"], track["artists"], "SoundCloud")
-            return
+        source_name = "SoundCloud"
 
-    await status.edit_text("Не удалось скачать трек")
+    if path and os.path.exists(path):
+        await status.delete()
+        await send_track(
+            callback.message,
+            path,
+            track["title"],
+            track["artists"],
+            source_name
+        )
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+    else:
+        await status.edit_text("Не удалось скачать этот трек")
 
 async def main():
     logger.info("Бот запущен")
