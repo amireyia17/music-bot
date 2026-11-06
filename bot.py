@@ -46,7 +46,7 @@ def format_duration(ms: int) -> str:
     m, s = divmod(sec, 60)
     return f"{m}:{s:02d}"
 
-async def search_yandex(query: str, limit: int = 8):
+async def search_yandex(query: str, limit: int = 15):
     if not ym_client:
         return []
     try:
@@ -87,7 +87,7 @@ async def download_yandex(track_id: str) -> str | None:
         logger.error(f"Ошибка скачивания Яндекс: {e}")
         return None
 
-async def search_soundcloud(query: str, limit: int = 4):
+async def search_soundcloud(query: str, limit: int = 8):
     ydl_opts = {
         "quiet": True,
         "no_warnings": True,
@@ -190,7 +190,7 @@ def build_results(results: list, user_id: int):
     lines = []
     buttons = []
 
-    for i, track in enumerate(results[:6]):
+    for i, track in enumerate(results[:12]):
         duration = format_duration(track.get("duration", 0))
         title = track["title"]
         artists = track["artists"]
@@ -272,7 +272,7 @@ async def handle_query(message: Message):
 
     yandex_results = await search_yandex(query)
     sc_results = await search_soundcloud(query)
-    all_results = yandex_results[:5] + sc_results[:2]
+    all_results = yandex_results[:10] + sc_results[:5]
 
     if not all_results:
         await status.edit_text("Ничего не найдено")
