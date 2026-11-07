@@ -8,7 +8,7 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.types import (
     Message, FSInputFile, CallbackQuery,
     InlineKeyboardMarkup, InlineKeyboardButton,
-    ReplyKeyboardMarkup, KeyboardButton
+    ReplyKeyboardMarkup, KeyboardButton, URLInputFile
 )
 from aiogram.filters import CommandStart, Command
 from aiogram.enums import ParseMode
@@ -38,8 +38,8 @@ if YANDEX_TOKEN:
     except Exception as e:
         logger.error(f"Ошибка Яндекс.Музыки: {e}")
 
-BOT_USERNAME = None
 search_cache = {}
+album_cache = {}
 PAGE_SIZE = 3
 
 def format_duration(ms: int) -> str:
@@ -93,9 +93,11 @@ async def search_yandex(query: str, limit: int = 20):
                 continue
             artists = ", ".join(a.name for a in track.artists) if track.artists else "Unknown"
             album_id = None
+            album_title = None
             try:
                 if track.albums:
-                    album_id = track.albums[0].id
+                    album_id = str(track.albums[0].id)
+                    album_title = track.albums[0].title
             except Exception:
                 pass
             results.append({
@@ -103,6 +105,7 @@ async def search_yandex(query: str, limit: int = 20):
                 "artists": artists,
                 "id": str(track.id),
                 "album_id": album_id,
+                "album_title": album_title,
                 "duration": duration,
                 "source": "yandex"
             })
@@ -191,6 +194,50 @@ async def download_yandex(track_id: str, album_id=None) -> tuple[str | None, str
         logger.error(f"Ошибка скачивания Яндекс {track_id}: {e}")
         return None, title, artists
 
+async def get_album_info(album_id: str):
+    if not ym_client:
+        return None
+    try:
+        album = ym_client.albums_with_tracks(album_id)
+        if not album:
+            return None
+
+        title = album.title or "Album"
+        artists = ", ".join(a.name for a in album.artists) if album.artists else ""
+        cover = None
+        try:
+            if album.cover_uri:
+                cover = "https://" + album.cover_uri.replace("%%", "400x400")
+        except Exception:
+            pass
+
+        tracks = []
+        for vol in (album.volumes or []):
+            for t in vol:
+                if not t:
+                    continue
+                t_artists = ", ".join(a.name for a in t.artists) if t.artists else artists
+                tracks.append({
+                    "id": str(t.id),
+                    "title": t.title or "Unknown",
+                    "artists": t_artists,
+                    "duration": getattr(t, "duration_ms", 0) or 0,
+                    "album_id": album_id,
+                    "album_title": title,
+                    "source": "yandex"
+                })
+
+        return {
+            "id": album_id,
+            "title": title,
+            "artists": artists,
+            "cover": cover,
+            "tracks": tracks
+        }
+    except Exception as e:
+        logger.error(f"Ошибка альбома {album_id}: {e}")
+        return None
+
 # ===================== SOUNDCLOUD =====================
 
 async def search_soundcloud(query: str, limit: int = 8):
@@ -220,7 +267,9 @@ async def search_soundcloud(query: str, limit: int = 8):
                         "url": url,
                         "id": str(entry.get("id", "")),
                         "duration": duration_ms,
-                        "source": "soundcloud"
+                        "source": "soundcloud",
+                        "album_id": None,
+                        "album_title": None,
                     })
             return results
     except Exception as e:
@@ -230,7 +279,6 @@ async def search_soundcloud(query: str, limit: int = 8):
 async def download_soundcloud(url: str) -> tuple[str | None, str, str]:
     temp_dir = tempfile.gettempdir()
     outtmpl = os.path.join(temp_dir, "%(id)s.%(ext)s")
-
     ydl_opts = {
         "format": "bestaudio/best",
         "outtmpl": outtmpl,
@@ -246,9 +294,7 @@ async def download_soundcloud(url: str) -> tuple[str | None, str, str]:
             "preferredquality": "192",
         }],
     }
-
     title, artists = "Track", "SoundCloud"
-
     try:
         with yt_dlp.YoutubeDL(ydl_opts_mp3) as ydl:
             info = ydl.extract_info(url, download=True)
@@ -261,7 +307,6 @@ async def download_soundcloud(url: str) -> tuple[str | None, str, str]:
                         return str(f), title, artists
     except Exception as e:
         logger.warning(f"SoundCloud mp3 failed: {e}")
-
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
@@ -274,7 +319,6 @@ async def download_soundcloud(url: str) -> tuple[str | None, str, str]:
                         return str(f), title, artists
     except Exception as e:
         logger.error(f"Ошибка скачивания SoundCloud: {e}")
-
     return None, title, artists
 
 # ===================== YOUTUBE =====================
@@ -298,7 +342,7 @@ async def search_youtube(query: str, limit: int = 10):
                     video_id = entry.get("id")
                     if not video_id:
                         continue
-                    url = entry.get("webpage_url") or entry.get("url") or f"https://www.youtube.com/watch?v={video_id}"
+                    url = entry.get("webpage_url") or f"https://www.youtube.com/watch?v={video_id}"
                     duration = entry.get("duration")
                     duration_ms = int(duration * 1000) if duration else 0
                     if duration and duration > 900:
@@ -309,7 +353,9 @@ async def search_youtube(query: str, limit: int = 10):
                         "url": url,
                         "id": str(video_id),
                         "duration": duration_ms,
-                        "source": "youtube"
+                        "source": "youtube",
+                        "album_id": None,
+                        "album_title": None,
                     })
             return results
     except Exception as e:
@@ -319,9 +365,7 @@ async def search_youtube(query: str, limit: int = 10):
 async def download_youtube(url: str) -> tuple[str | None, str, str]:
     temp_dir = tempfile.gettempdir()
     outtmpl = os.path.join(temp_dir, "yt_%(id)s.%(ext)s")
-
     title, artists = "Track", "YouTube"
-
     ydl_opts_mp3 = {
         "format": "bestaudio/best",
         "outtmpl": outtmpl,
@@ -334,7 +378,6 @@ async def download_youtube(url: str) -> tuple[str | None, str, str]:
             "preferredquality": "192",
         }],
     }
-
     try:
         with yt_dlp.YoutubeDL(ydl_opts_mp3) as ydl:
             info = ydl.extract_info(url, download=True)
@@ -347,7 +390,6 @@ async def download_youtube(url: str) -> tuple[str | None, str, str]:
                         return str(f), title, artists
     except Exception as e:
         logger.warning(f"YouTube mp3 failed: {e}")
-
     try:
         ydl_opts = {
             "format": "bestaudio/best",
@@ -367,10 +409,7 @@ async def download_youtube(url: str) -> tuple[str | None, str, str]:
                         return str(f), title, artists
     except Exception as e:
         logger.error(f"Ошибка скачивания YouTube: {e}")
-
     return None, title, artists
-
-# ===================== SPOTIFY =====================
 
 async def spotify_to_query(url: str) -> str | None:
     try:
@@ -388,13 +427,12 @@ async def spotify_to_query(url: str) -> str | None:
         logger.warning(f"Spotify metadata failed: {e}")
     return None
 
-# ===================== DOWNLOAD + FALLBACK =====================
+# ===================== CORE =====================
 
 async def download_by_track(track: dict) -> tuple[str | None, str, str]:
     prefer_title = track.get("title") or "Unknown"
     prefer_artists = track.get("artists") or "Unknown"
     source = track.get("source")
-
     path = None
 
     if source == "yandex":
@@ -408,36 +446,38 @@ async def download_by_track(track: dict) -> tuple[str | None, str, str]:
         return path, prefer_title, prefer_artists
 
     q = f"{prefer_artists} {prefer_title}".strip()
-    logger.info(f"Fallback for: {q}")
-
     yt = await search_youtube(q)
     for item in yt[:5]:
         path, _, _ = await download_youtube(item["url"])
         if path:
             return path, prefer_title, prefer_artists
-
     sc = await search_soundcloud(q)
     for item in sc[:3]:
         path, _, _ = await download_soundcloud(item["url"])
         if path:
             return path, prefer_title, prefer_artists
-
     if source != "yandex":
         ym = await search_yandex(q)
         for item in ym[:3]:
             path, _, _ = await download_yandex(item["id"], item.get("album_id"))
             if path:
                 return path, prefer_title, prefer_artists
-
     return None, prefer_title, prefer_artists
 
-async def send_track(message: Message, path: str, title: str, artists: str):
+async def send_track(message: Message, path: str, title: str, artists: str, album_id=None, album_title=None):
+    kb = None
+    if album_id and album_title:
+        short = album_title if len(album_title) <= 40 else album_title[:37] + "…"
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=f"💿 {short}", callback_data=f"album:{album_id}")]
+        ])
     try:
         audio = FSInputFile(path, filename=f"{artists} - {title}.mp3")
         await message.answer_audio(
             audio,
             title=title[:64],
-            performer=artists[:64]
+            performer=artists[:64],
+            reply_markup=kb
         )
     finally:
         try:
@@ -447,15 +487,14 @@ async def send_track(message: Message, path: str, title: str, artists: str):
 
 def main_keyboard():
     return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="Песни"), KeyboardButton(text="Скачать")]
-        ],
+        keyboard=[[KeyboardButton(text="Песни"), KeyboardButton(text="Скачать")]],
         resize_keyboard=True
     )
 
 def build_page(user_id: int, page: int):
+    """Внешний вид как на скрине + клик без /start"""
     data = search_cache.get(user_id)
-    if not data or not BOT_USERNAME:
+    if not data:
         return None, None
 
     results = data["results"]
@@ -468,30 +507,30 @@ def build_page(user_id: int, page: int):
     page_tracks = results[start:start + PAGE_SIZE]
 
     lines = []
+    buttons = []
+
     for i, track in enumerate(page_tracks):
         global_index = start + i
         duration = format_duration(track.get("duration", 0))
         title = track["title"]
         artists = track["artists"]
 
-        # Кликабельное название (deep-link), без больших кнопок
-        if track["source"] == "yandex":
-            payload = f"y{track['id']}"
-        elif track["source"] == "youtube":
-            payload = f"t{track['id']}"  # youtube video id
-        else:
-            payload = f"x{user_id}_{global_index}"
-
-        link = f"https://t.me/{BOT_USERNAME}?start={payload}"
+        # Текст строго как на скрине
         lines.append(
-            f"🎵 <a href=\"{link}\">«{title}»</a>\n"
+            f"🎵 «{title}»\n"
             f"{duration} · {artists}"
         )
 
+        # Кнопка = то же название (вместо ссылки, чтобы не было /start)
+        btn = f"«{title}»"
+        if len(btn) > 60:
+            btn = btn[:57] + "…»"
+        buttons.append([
+            InlineKeyboardButton(text=btn, callback_data=f"dl:{user_id}:{global_index}")
+        ])
+
     text = "\n\n".join(lines)
 
-    # Только стрелки пагинации
-    buttons = []
     if total_pages > 1:
         nav = []
         if page > 0:
@@ -501,76 +540,10 @@ def build_page(user_id: int, page: int):
         if nav:
             buttons.append(nav)
 
-    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons) if buttons else None
-    return text, keyboard
+    return text, InlineKeyboardMarkup(inline_keyboard=buttons)
 
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
-    global BOT_USERNAME
-    if not BOT_USERNAME:
-        me = await bot.get_me()
-        BOT_USERNAME = me.username
-
-    args = message.text.split(maxsplit=1)
-    payload = args[1].strip() if len(args) > 1 else ""
-
-    # Яндекс
-    if payload.startswith("y") and payload[1:].isdigit():
-        track_id = payload[1:]
-        status = await message.answer("Скачиваю…")
-        path, title, artists = await download_yandex(track_id)
-        if not path:
-            # fallback
-            path, title, artists = await download_by_track({
-                "title": title or "track",
-                "artists": artists or "",
-                "source": "yandex",
-                "id": track_id
-            })
-        if path:
-            await status.delete()
-            await send_track(message, path, title, artists)
-        else:
-            await status.edit_text("Не удалось скачать трек")
-        return
-
-    # YouTube по video id
-    if payload.startswith("t") and len(payload) > 1:
-        video_id = payload[1:]
-        status = await message.answer("Скачиваю…")
-        url = f"https://www.youtube.com/watch?v={video_id}"
-        path, title, artists = await download_youtube(url)
-        if path:
-            await status.delete()
-            await send_track(message, path, title, artists)
-        else:
-            await status.edit_text("Не удалось скачать трек")
-        return
-
-    # SoundCloud / кэш
-    if payload.startswith("x"):
-        try:
-            rest = payload[1:]
-            user_id_str, idx_str = rest.split("_", 1)
-            user_id = int(user_id_str)
-            idx = int(idx_str)
-            data = search_cache.get(user_id)
-            if not data or idx >= len(data["results"]):
-                await message.answer("Результаты устарели, поищи трек заново")
-                return
-            track = data["results"][idx]
-            status = await message.answer("Скачиваю…")
-            path, title, artists = await download_by_track(track)
-            if path:
-                await status.delete()
-                await send_track(message, path, title, artists)
-            else:
-                await status.edit_text("Не удалось скачать трек")
-        except Exception as e:
-            logger.error(e)
-            await message.answer("Ошибка. Поищи трек заново")
-        return
-
     await message.answer(
         "Отправь название трека или исполнителя\n"
         "Можно ссылки: Яндекс / SoundCloud / YouTube / Spotify",
@@ -579,10 +552,7 @@ async def cmd_start(message: Message):
 
 @dp.message(Command("help"))
 async def cmd_help(message: Message):
-    await message.answer(
-        "Напиши название песни и нажми на название трека.",
-        reply_markup=main_keyboard()
-    )
+    await message.answer("Напиши название песни и нажми на трек.", reply_markup=main_keyboard())
 
 @dp.message(F.text.in_({"Песни", "Скачать", "Songs", "Download"}))
 async def menu_buttons(message: Message):
@@ -590,11 +560,6 @@ async def menu_buttons(message: Message):
 
 @dp.message(F.text)
 async def handle_query(message: Message):
-    global BOT_USERNAME
-    if not BOT_USERNAME:
-        me = await bot.get_me()
-        BOT_USERNAME = me.username
-
     query = message.text.strip()
     user_id = message.from_user.id
 
@@ -624,8 +589,6 @@ async def handle_query(message: Message):
         if not q:
             await status.edit_text("Не смог прочитать Spotify. Напиши название текстом.")
             return
-        track = {"title": q, "artists": "", "source": "youtube", "url": ""}
-        # поиск и скачивание
         yt = await search_youtube(q)
         if yt:
             path, title, artists = await download_by_track(yt[0])
@@ -661,7 +624,6 @@ async def handle_query(message: Message):
     yandex_results = await search_yandex(query)
     sc_results = await search_soundcloud(query)
     yt_results = await search_youtube(query)
-
     all_results = rank_results(yandex_results + sc_results + yt_results, query)
 
     if not all_results:
@@ -670,12 +632,7 @@ async def handle_query(message: Message):
 
     search_cache[user_id] = {"results": all_results, "page": 0}
     text, keyboard = build_page(user_id, 0)
-    await status.edit_text(
-        text,
-        reply_markup=keyboard,
-        parse_mode=ParseMode.HTML,
-        disable_web_page_preview=True
-    )
+    await status.edit_text(text, reply_markup=keyboard)
 
 @dp.callback_query(F.data.startswith("page:"))
 async def on_page(callback: CallbackQuery):
@@ -686,32 +643,172 @@ async def on_page(callback: CallbackQuery):
     except Exception:
         await callback.answer()
         return
+    if callback.from_user.id != user_id:
+        await callback.answer("Это не твой поиск", show_alert=True)
+        return
+    text, keyboard = build_page(user_id, page)
+    if text is None:
+        await callback.answer("Результаты устарели", show_alert=True)
+        return
+    await callback.answer()
+    try:
+        await callback.message.edit_text(text, reply_markup=keyboard)
+    except Exception:
+        pass
+
+@dp.callback_query(F.data.startswith("dl:"))
+async def on_download(callback: CallbackQuery):
+    try:
+        _, user_id_str, index_str = callback.data.split(":")
+        user_id = int(user_id_str)
+        index = int(index_str)
+    except Exception:
+        await callback.answer("Ошибка", show_alert=True)
+        return
 
     if callback.from_user.id != user_id:
         await callback.answer("Это не твой поиск", show_alert=True)
         return
 
-    text, keyboard = build_page(user_id, page)
-    if text is None:
-        await callback.answer("Результаты устарели", show_alert=True)
+    data = search_cache.get(user_id)
+    if not data or index >= len(data["results"]):
+        await callback.answer("Результаты устарели, поищи заново", show_alert=True)
         return
 
+    track = data["results"][index]
     await callback.answer()
-    try:
-        await callback.message.edit_text(
-            text,
-            reply_markup=keyboard,
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True
+    status = await callback.message.answer(f"Скачиваю «{track['title']}»…")
+
+    path, title, artists = await download_by_track(track)
+    if path:
+        await status.delete()
+        await send_track(
+            callback.message, path, title, artists,
+            album_id=track.get("album_id"),
+            album_title=track.get("album_title")
         )
+    else:
+        await status.edit_text("Не удалось скачать этот трек")
+
+@dp.callback_query(F.data.startswith("album:"))
+async def on_album(callback: CallbackQuery):
+    album_id = callback.data.split(":", 1)[1]
+    await callback.answer()
+    status = await callback.message.answer("Загружаю альбом…")
+
+    info = await get_album_info(album_id)
+    if not info or not info["tracks"]:
+        await status.edit_text("Не удалось загрузить альбом")
+        return
+
+    user_id = callback.from_user.id
+    album_cache[user_id] = info
+
+    lines = [f"<b>{info['artists']} — {info['title']}</b>\n"]
+    buttons = []
+    for i, t in enumerate(info["tracks"][:25]):
+        lines.append(f"{i + 1}. {t['title']}")
+        btn = f"{i + 1}. {t['title']}"
+        if len(btn) > 60:
+            btn = btn[:57] + "…"
+        buttons.append([InlineKeyboardButton(text=btn, callback_data=f"adl:{user_id}:{i}")])
+
+    buttons.append([
+        InlineKeyboardButton(text="📥 Скачать весь альбом", callback_data=f"adlall:{user_id}")
+    ])
+
+    text = "\n".join(lines)
+    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+
+    try:
+        await status.delete()
     except Exception:
         pass
 
+    if info.get("cover"):
+        try:
+            await callback.message.answer_photo(
+                URLInputFile(info["cover"]),
+                caption=text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb
+            )
+            return
+        except Exception as e:
+            logger.warning(f"cover failed: {e}")
+
+    await callback.message.answer(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+
+@dp.callback_query(F.data.startswith("adl:"))
+async def on_album_track(callback: CallbackQuery):
+    try:
+        _, user_id_str, index_str = callback.data.split(":")
+        user_id = int(user_id_str)
+        index = int(index_str)
+    except Exception:
+        await callback.answer("Ошибка", show_alert=True)
+        return
+
+    if callback.from_user.id != user_id:
+        await callback.answer("Это не твой альбом", show_alert=True)
+        return
+
+    info = album_cache.get(user_id)
+    if not info or index >= len(info["tracks"]):
+        await callback.answer("Альбом устарел", show_alert=True)
+        return
+
+    track = info["tracks"][index]
+    await callback.answer()
+    status = await callback.message.answer(f"Скачиваю «{track['title']}»…")
+    path, title, artists = await download_by_track(track)
+    if path:
+        await status.delete()
+        await send_track(
+            callback.message, path, title, artists,
+            album_id=track.get("album_id"),
+            album_title=track.get("album_title")
+        )
+    else:
+        await status.edit_text("Не удалось скачать")
+
+@dp.callback_query(F.data.startswith("adlall:"))
+async def on_album_all(callback: CallbackQuery):
+    try:
+        user_id = int(callback.data.split(":")[1])
+    except Exception:
+        await callback.answer("Ошибка", show_alert=True)
+        return
+
+    if callback.from_user.id != user_id:
+        await callback.answer("Это не твой альбом", show_alert=True)
+        return
+
+    info = album_cache.get(user_id)
+    if not info:
+        await callback.answer("Альбом устарел", show_alert=True)
+        return
+
+    await callback.answer()
+    status = await callback.message.answer(f"Скачиваю альбом «{info['title']}»…")
+
+    ok = 0
+    for track in info["tracks"][:20]:
+        path, title, artists = await download_by_track(track)
+        if path:
+            await send_track(
+                callback.message, path, title, artists,
+                album_id=track.get("album_id"),
+                album_title=track.get("album_title")
+            )
+            ok += 1
+            await asyncio.sleep(1)
+
+    await status.edit_text(f"Готово: {ok} из {min(len(info['tracks']), 20)} треков")
+
 async def main():
-    global BOT_USERNAME
     me = await bot.get_me()
-    BOT_USERNAME = me.username
-    logger.info(f"Бот @{BOT_USERNAME} запущен")
+    logger.info(f"Бот @{me.username} запущен")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
