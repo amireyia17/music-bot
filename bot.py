@@ -85,10 +85,17 @@ async def search_yandex(query: str, limit: int = 30):
             if duration and duration < 25000:
                 continue
             artists = ", ".join(a.name for a in track.artists) if track.artists else "Unknown"
+            album_id = None
+            try:
+                if track.albums:
+                    album_id = track.albums[0].id
+            except Exception:
+                pass
             results.append({
                 "title": track.title or "Unknown",
                 "artists": artists,
                 "id": str(track.id),
+                "album_id": album_id,
                 "duration": duration,
                 "source": "yandex"
             })
@@ -97,44 +104,90 @@ async def search_yandex(query: str, limit: int = 30):
         logger.error(f"Ошибка поиска Яндекс: {e}")
         return []
 
-async def download_yandex(track_id: str) -> tuple[str | None, str, str]:
+async def download_yandex(track_id: str, album_id=None) -> tuple[str | None, str, str]:
     """Возвращает (path, title, artists)"""
     if not ym_client:
         return None, "", ""
+
+    title, artists = "Unknown", "Unknown"
+    path = os.path.join(tempfile.gettempdir(), f"ym_{track_id}.mp3")
+
     try:
         tracks = ym_client.tracks([track_id])
         if not tracks:
-            logger.error(f"Трек {track_id} не найден")
-            return None, "", ""
+            return None, title, artists
+
         track = tracks[0]
         title = track.title or "Unknown"
         artists = ", ".join(a.name for a in track.artists) if track.artists else "Unknown"
 
-        path = os.path.join(tempfile.gettempdir(), f"ym_{track_id}.mp3")
+        if not album_id:
+            try:
+                if track.albums:
+                    album_id = track.albums[0].id
+            except Exception:
+                pass
 
-        # Способ 1
+        # --- Попытка 1: download_info ---
         try:
-            infos = track.get_download_info()
+            infos = track.get_download_info(get_direct_links=True)
             if infos:
-                best = max(infos, key=lambda x: x.bitrate_in_kbps or 0)
-                best.download(path)
+                infos_sorted = sorted(
+                    infos,
+                    key=lambda x: (
+                        0 if (x.codec or "").lower() == "mp3" else 1,
+                        -(x.bitrate_in_kbps or 0)
+                    )
+                )
+                for info in infos_sorted:
+                    try:
+                        info.download(path)
+                        if os.path.exists(path) and os.path.getsize(path) > 1000:
+                            return path, title, artists
+                    except Exception as e:
+                        logger.warning(f"info.download failed: {e}")
+        except Exception as e:
+            logger.warning(f"get_download_info failed: {e}")
+
+        # --- Попытка 2: track.download с разным качеством ---
+        for codec, bitrate in [("mp3", 192), ("mp3", 128), ("mp3", 64), ("aac", 192), ("aac", 64)]:
+            try:
+                track.download(path, codec=codec, bitrate_in_kbps=bitrate)
                 if os.path.exists(path) and os.path.getsize(path) > 1000:
                     return path, title, artists
-        except Exception as e:
-            logger.warning(f"download_info failed: {e}")
+            except Exception as e:
+                logger.warning(f"track.download {codec}/{bitrate} failed: {e}")
 
-        # Способ 2
-        try:
-            track.download(path)
-            if os.path.exists(path) and os.path.getsize(path) > 1000:
-                return path, title, artists
-        except Exception as e:
-            logger.warning(f"track.download failed: {e}")
+        # --- Попытка 3: yt-dlp ---
+        urls = []
+        if album_id:
+            urls.append(f"https://music.yandex.ru/album/{album_id}/track/{track_id}")
+        urls.append(f"https://music.yandex.ru/track/{track_id}")
+
+        for url in urls:
+            try:
+                outtmpl = os.path.join(tempfile.gettempdir(), f"ym_yt_{track_id}.%(ext)s")
+                ydl_opts = {
+                    "format": "bestaudio/best",
+                    "outtmpl": outtmpl,
+                    "quiet": True,
+                    "no_warnings": True,
+                    "noprogress": True,
+                }
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(url, download=True)
+                    if info:
+                        for f in Path(tempfile.gettempdir()).glob(f"ym_yt_{track_id}*"):
+                            if f.is_file() and f.stat().st_size > 1000:
+                                return str(f), title, artists
+            except Exception as e:
+                logger.warning(f"yt-dlp yandex failed ({url}): {e}")
 
         return None, title, artists
+
     except Exception as e:
         logger.error(f"Ошибка скачивания Яндекс {track_id}: {e}")
-        return None, "", ""
+        return None, title, artists
 
 async def search_soundcloud(query: str, limit: int = 10):
     ydl_opts = {
@@ -262,11 +315,9 @@ def build_page(user_id: int, page: int):
         title = track["title"]
         artists = track["artists"]
 
-        # Ссылка сразу с id трека (Яндекс) или индексом (SoundCloud)
         if track["source"] == "yandex":
             payload = f"y{track['id']}"
         else:
-            # для SC храним в кэше, передаём индекс
             idx = results.index(track)
             payload = f"s{user_id}_{idx}"
 
@@ -301,7 +352,7 @@ async def cmd_start(message: Message):
     args = message.text.split(maxsplit=1)
     payload = args[1].strip() if len(args) > 1 else ""
 
-    # Скачивание по ссылке из названия
+    # Скачивание Яндекс по id
     if payload.startswith("y") and payload[1:].isdigit():
         track_id = payload[1:]
         status = await message.answer("Скачиваю…")
@@ -310,9 +361,19 @@ async def cmd_start(message: Message):
             await status.delete()
             await send_track(message, path, title, artists)
         else:
+            # fallback: ищем этот же трек на SoundCloud
+            await status.edit_text("Пробую найти на SoundCloud…")
+            sc_results = await search_soundcloud(f"{artists} {title}")
+            if sc_results:
+                path2, title2, artists2 = await download_soundcloud(sc_results[0]["url"])
+                if path2:
+                    await status.delete()
+                    await send_track(message, path2, title2 or title, artists2 or artists)
+                    return
             await status.edit_text("Не удалось скачать трек")
         return
 
+    # Скачивание SoundCloud по индексу
     if payload.startswith("s"):
         try:
             rest = payload[1:]
