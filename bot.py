@@ -56,6 +56,7 @@ def rank_results(results: list, query: str) -> list:
     def score(track):
         title = (track.get("title") or "").lower()
         artists = (track.get("artists") or "").lower()
+        source = track.get("source", "")
         s = 0
         if q in artists or artists in q:
             s += 50
@@ -68,11 +69,17 @@ def rank_results(results: list, query: str) -> list:
                 s += 8
         if (track.get("duration") or 0) > 60000:
             s += 3
+        if source == "yandex":
+            s += 5
+        elif source == "youtube":
+            s += 2
         return s
 
     return sorted(results, key=score, reverse=True)
 
-async def search_yandex(query: str, limit: int = 30):
+# ===================== YANDEX =====================
+
+async def search_yandex(query: str, limit: int = 20):
     if not ym_client:
         return []
     try:
@@ -105,7 +112,6 @@ async def search_yandex(query: str, limit: int = 30):
         return []
 
 async def download_yandex(track_id: str, album_id=None) -> tuple[str | None, str, str]:
-    """Возвращает (path, title, artists)"""
     if not ym_client:
         return None, "", ""
 
@@ -128,7 +134,6 @@ async def download_yandex(track_id: str, album_id=None) -> tuple[str | None, str
             except Exception:
                 pass
 
-        # --- Попытка 1: download_info ---
         try:
             infos = track.get_download_info(get_direct_links=True)
             if infos:
@@ -149,7 +154,6 @@ async def download_yandex(track_id: str, album_id=None) -> tuple[str | None, str
         except Exception as e:
             logger.warning(f"get_download_info failed: {e}")
 
-        # --- Попытка 2: track.download с разным качеством ---
         for codec, bitrate in [("mp3", 192), ("mp3", 128), ("mp3", 64), ("aac", 192), ("aac", 64)]:
             try:
                 track.download(path, codec=codec, bitrate_in_kbps=bitrate)
@@ -158,7 +162,6 @@ async def download_yandex(track_id: str, album_id=None) -> tuple[str | None, str
             except Exception as e:
                 logger.warning(f"track.download {codec}/{bitrate} failed: {e}")
 
-        # --- Попытка 3: yt-dlp ---
         urls = []
         if album_id:
             urls.append(f"https://music.yandex.ru/album/{album_id}/track/{track_id}")
@@ -184,12 +187,13 @@ async def download_yandex(track_id: str, album_id=None) -> tuple[str | None, str
                 logger.warning(f"yt-dlp yandex failed ({url}): {e}")
 
         return None, title, artists
-
     except Exception as e:
         logger.error(f"Ошибка скачивания Яндекс {track_id}: {e}")
         return None, title, artists
 
-async def search_soundcloud(query: str, limit: int = 10):
+# ===================== SOUNDCLOUD =====================
+
+async def search_soundcloud(query: str, limit: int = 8):
     ydl_opts = {
         "quiet": True,
         "no_warnings": True,
@@ -273,6 +277,123 @@ async def download_soundcloud(url: str) -> tuple[str | None, str, str]:
 
     return None, title, artists
 
+# ===================== YOUTUBE =====================
+
+async def search_youtube(query: str, limit: int = 8):
+    ydl_opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "extract_flat": "in_playlist",
+        "default_search": "ytsearch",
+        "playlistend": limit,
+    }
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(f"ytsearch{limit}:{query}", download=False)
+            results = []
+            if info and "entries" in info:
+                for entry in info["entries"][:limit]:
+                    if not entry:
+                        continue
+                    video_id = entry.get("id")
+                    if not video_id:
+                        continue
+                    url = entry.get("url") or entry.get("webpage_url") or f"https://www.youtube.com/watch?v={video_id}"
+                    duration = entry.get("duration")
+                    duration_ms = int(duration * 1000) if duration else 0
+                    if duration and duration > 900:
+                        continue
+                    results.append({
+                        "title": entry.get("title") or "Unknown",
+                        "artists": entry.get("uploader") or entry.get("channel") or "YouTube",
+                        "url": url,
+                        "id": str(video_id),
+                        "duration": duration_ms,
+                        "source": "youtube"
+                    })
+            return results
+    except Exception as e:
+        logger.error(f"Ошибка поиска YouTube: {e}")
+        return []
+
+async def download_youtube(url: str) -> tuple[str | None, str, str]:
+    temp_dir = tempfile.gettempdir()
+    outtmpl = os.path.join(temp_dir, "yt_%(id)s.%(ext)s")
+
+    ydl_opts = {
+        "format": "bestaudio/best",
+        "outtmpl": outtmpl,
+        "quiet": True,
+        "no_warnings": True,
+        "noprogress": True,
+        "postprocessors": [{
+            "key": "FFmpegExtractAudio",
+            "preferredcodec": "mp3",
+            "preferredquality": "192",
+        }],
+    }
+
+    title, artists = "Track", "YouTube"
+
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            if info:
+                title = info.get("title") or title
+                artists = info.get("uploader") or info.get("channel") or artists
+                track_id = str(info.get("id", ""))
+                for f in Path(temp_dir).glob(f"yt_{track_id}*"):
+                    if f.suffix.lower() in {".mp3", ".m4a", ".webm", ".opus", ".ogg"}:
+                        return str(f), title, artists
+    except Exception as e:
+        logger.warning(f"YouTube mp3 failed: {e}")
+
+    try:
+        ydl_opts2 = {
+            "format": "bestaudio/best",
+            "outtmpl": outtmpl,
+            "quiet": True,
+            "no_warnings": True,
+            "noprogress": True,
+        }
+        with yt_dlp.YoutubeDL(ydl_opts2) as ydl:
+            info = ydl.extract_info(url, download=True)
+            if info:
+                title = info.get("title") or title
+                artists = info.get("uploader") or info.get("channel") or artists
+                track_id = str(info.get("id", ""))
+                for f in Path(temp_dir).glob(f"yt_{track_id}*"):
+                    if f.is_file():
+                        return str(f), title, artists
+    except Exception as e:
+        logger.error(f"Ошибка скачивания YouTube: {e}")
+
+    return None, title, artists
+
+# ===================== SPOTIFY → YouTube =====================
+
+async def spotify_to_youtube_query(url: str) -> str | None:
+    try:
+        ydl_opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "skip_download": True,
+        }
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            if info:
+                title = info.get("track") or info.get("title") or ""
+                artist = info.get("artist") or info.get("uploader") or ""
+                if isinstance(artist, list):
+                    artist = ", ".join(artist)
+                query = f"{artist} {title}".strip()
+                return query if query else None
+    except Exception as e:
+        logger.warning(f"Spotify metadata failed: {e}")
+    return None
+
+# ===================== ОБЩЕЕ =====================
+
 async def send_track(message: Message, path: str, title: str, artists: str):
     try:
         audio = FSInputFile(path, filename=f"{artists} - {title}.mp3")
@@ -319,7 +440,7 @@ def build_page(user_id: int, page: int):
             payload = f"y{track['id']}"
         else:
             idx = results.index(track)
-            payload = f"s{user_id}_{idx}"
+            payload = f"x{user_id}_{idx}"
 
         link = f"https://t.me/{BOT_USERNAME}?start={payload}"
         lines.append(
@@ -342,6 +463,16 @@ def build_page(user_id: int, page: int):
     keyboard = InlineKeyboardMarkup(inline_keyboard=buttons) if buttons else None
     return text, keyboard
 
+async def download_by_track(track: dict) -> tuple[str | None, str, str]:
+    source = track.get("source")
+    if source == "yandex":
+        return await download_yandex(track["id"], track.get("album_id"))
+    if source == "soundcloud":
+        return await download_soundcloud(track["url"])
+    if source == "youtube":
+        return await download_youtube(track["url"])
+    return None, track.get("title", ""), track.get("artists", "")
+
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
     global BOT_USERNAME
@@ -352,7 +483,6 @@ async def cmd_start(message: Message):
     args = message.text.split(maxsplit=1)
     payload = args[1].strip() if len(args) > 1 else ""
 
-    # Скачивание Яндекс по id
     if payload.startswith("y") and payload[1:].isdigit():
         track_id = payload[1:]
         status = await message.answer("Скачиваю…")
@@ -360,21 +490,25 @@ async def cmd_start(message: Message):
         if path:
             await status.delete()
             await send_track(message, path, title, artists)
-        else:
-            # fallback: ищем этот же трек на SoundCloud
-            await status.edit_text("Пробую найти на SoundCloud…")
-            sc_results = await search_soundcloud(f"{artists} {title}")
-            if sc_results:
-                path2, title2, artists2 = await download_soundcloud(sc_results[0]["url"])
+            return
+
+        await status.edit_text("Пробую другие источники…")
+        q = f"{artists} {title}".strip()
+        for searcher, downloader in [
+            (search_soundcloud, download_soundcloud),
+            (search_youtube, download_youtube),
+        ]:
+            results = await searcher(q)
+            if results:
+                path2, t2, a2 = await downloader(results[0]["url"])
                 if path2:
                     await status.delete()
-                    await send_track(message, path2, title2 or title, artists2 or artists)
+                    await send_track(message, path2, t2 or title, a2 or artists)
                     return
-            await status.edit_text("Не удалось скачать трек")
+        await status.edit_text("Не удалось скачать трек")
         return
 
-    # Скачивание SoundCloud по индексу
-    if payload.startswith("s"):
+    if payload.startswith("x"):
         try:
             rest = payload[1:]
             user_id_str, idx_str = rest.split("_", 1)
@@ -386,7 +520,7 @@ async def cmd_start(message: Message):
                 return
             track = data["results"][idx]
             status = await message.answer("Скачиваю…")
-            path, title, artists = await download_soundcloud(track["url"])
+            path, title, artists = await download_by_track(track)
             if path:
                 await status.delete()
                 await send_track(message, path, title or track["title"], artists or track["artists"])
@@ -398,14 +532,16 @@ async def cmd_start(message: Message):
         return
 
     await message.answer(
-        "Отправь название трека или исполнителя",
+        "Отправь название трека или исполнителя\n"
+        "Можно ссылки: Яндекс / SoundCloud / YouTube / Spotify",
         reply_markup=main_keyboard()
     )
 
 @dp.message(Command("help"))
 async def cmd_help(message: Message):
     await message.answer(
-        "Напиши название песни и нажми на название трека.",
+        "Напиши название песни или кинь ссылку.\n"
+        "Источники: Яндекс.Музыка, SoundCloud, YouTube (+ Spotify ссылки).",
         reply_markup=main_keyboard()
     )
 
@@ -424,7 +560,7 @@ async def handle_query(message: Message):
     user_id = message.from_user.id
 
     if "soundcloud.com" in query.lower():
-        status = await message.answer("Скачиваю...")
+        status = await message.answer("Скачиваю с SoundCloud...")
         path, title, artists = await download_soundcloud(query)
         if path:
             await status.delete()
@@ -433,8 +569,48 @@ async def handle_query(message: Message):
             await status.edit_text("Не удалось скачать")
         return
 
+    if "youtube.com" in query.lower() or "youtu.be" in query.lower():
+        status = await message.answer("Скачиваю с YouTube...")
+        path, title, artists = await download_youtube(query)
+        if path:
+            await status.delete()
+            await send_track(message, path, title, artists)
+        else:
+            await status.edit_text("Не удалось скачать")
+        return
+
+    if "spotify.com" in query.lower() or "spotify.link" in query.lower():
+        status = await message.answer("Ищу трек из Spotify…")
+        yt_query = await spotify_to_youtube_query(query)
+        if not yt_query:
+            await status.edit_text("Не смог прочитать Spotify. Напиши название трека текстом.")
+            return
+        yandex_results = await search_yandex(yt_query)
+        if yandex_results:
+            path, title, artists = await download_yandex(yandex_results[0]["id"], yandex_results[0].get("album_id"))
+            if path:
+                await status.delete()
+                await send_track(message, path, title, artists)
+                return
+        sc = await search_soundcloud(yt_query)
+        if sc:
+            path, title, artists = await download_soundcloud(sc[0]["url"])
+            if path:
+                await status.delete()
+                await send_track(message, path, title, artists)
+                return
+        yt = await search_youtube(yt_query)
+        if yt:
+            path, title, artists = await download_youtube(yt[0]["url"])
+            if path:
+                await status.delete()
+                await send_track(message, path, title, artists)
+                return
+        await status.edit_text("Не удалось скачать трек из Spotify")
+        return
+
     if "music.yandex." in query and ym_client:
-        status = await message.answer("Скачиваю...")
+        status = await message.answer("Скачиваю с Яндекс.Музыки...")
         try:
             parts = query.split("/")
             track_id = None
@@ -453,11 +629,13 @@ async def handle_query(message: Message):
         await status.edit_text("Не удалось скачать")
         return
 
-    status = await message.answer("Ищу...")
+    status = await message.answer("w8^*^")
 
     yandex_results = await search_yandex(query)
     sc_results = await search_soundcloud(query)
-    all_results = rank_results(yandex_results + sc_results, query)
+    yt_results = await search_youtube(query)
+
+    all_results = rank_results(yandex_results + sc_results + yt_results, query)
 
     if not all_results:
         await status.edit_text("Ничего не найдено")
