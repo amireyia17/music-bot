@@ -1,9 +1,8 @@
 import os
-import time
-import base64
 import asyncio
 import tempfile
 import logging
+import re
 from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F
@@ -23,8 +22,6 @@ load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 YANDEX_TOKEN = os.getenv("YANDEX_TOKEN")
-SPOTIFY_CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID")
-SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET")
 
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN не задан")
@@ -46,8 +43,13 @@ if YANDEX_TOKEN:
 BOT_USERNAME = None
 search_cache = {}
 album_cache = {}
-spotify_token = {"access": None, "expires": 0}
 PAGE_SIZE = 3
+
+JUNK_RE = re.compile(
+    r"(slowed|reverb|nightcore|8d\s*audio|lyrics?\s*video|official\s*video|"
+    r"visualizer|fan\s*made|cover\s*by|karaoke|instrumental\s*only)",
+    re.I,
+)
 
 def format_duration(ms: int) -> str:
     if not ms:
@@ -56,125 +58,162 @@ def format_duration(ms: int) -> str:
     m, s = divmod(sec, 60)
     return f"{m}:{s:02d}"
 
-# ===================== SPOTIFY =====================
+def rank_results(results: list, query: str) -> list:
+    q = query.lower().strip()
+    q_words = set(w for w in q.split() if len(w) > 1)
 
-async def get_spotify_token() -> str | None:
-    if not SPOTIFY_CLIENT_ID or not SPOTIFY_CLIENT_SECRET:
-        logger.warning("SPOTIFY_CLIENT_ID / SECRET не заданы")
-        return None
-    if spotify_token["access"] and time.time() < spotify_token["expires"] - 60:
-        return spotify_token["access"]
-    try:
-        auth = base64.b64encode(
-            f"{SPOTIFY_CLIENT_ID}:{SPOTIFY_CLIENT_SECRET}".encode()
-        ).decode()
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                "https://accounts.spotify.com/api/token",
-                headers={
-                    "Authorization": f"Basic {auth}",
-                    "Content-Type": "application/x-www-form-urlencoded",
-                },
-                data={"grant_type": "client_credentials"},
-            ) as resp:
-                if resp.status != 200:
-                    logger.error(f"Spotify token: {await resp.text()}")
-                    return None
-                data = await resp.json()
-                spotify_token["access"] = data["access_token"]
-                spotify_token["expires"] = time.time() + data.get("expires_in", 3600)
-                return spotify_token["access"]
-    except Exception as e:
-        logger.error(f"Spotify auth: {e}")
-        return None
+    def score(track):
+        title = (track.get("title") or "").lower()
+        artists = (track.get("artists") or "").lower()
+        source = track.get("source", "")
+        s = 0
+        if q in artists or artists in q:
+            s += 40
+        for w in q_words:
+            if w in artists:
+                s += 12
+            if w in title:
+                s += 8
+        if JUNK_RE.search(title):
+            s -= 30
+        if (track.get("duration") or 0) > 60000:
+            s += 3
+        if source == "yandex":
+            s += 25
+        elif source == "soundcloud":
+            s += 5
+        return s
 
-async def search_spotify(query: str, limit: int = 15) -> list:
-    token = await get_spotify_token()
-    if not token:
+    return sorted(results, key=score, reverse=True)
+
+# ===================== YANDEX =====================
+
+async def search_yandex(query: str, limit: int = 20):
+    if not ym_client:
         return []
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                "https://api.spotify.com/v1/search",
-                headers={"Authorization": f"Bearer {token}"},
-                params={"q": query, "type": "track", "limit": limit},
-            ) as resp:
-                if resp.status != 200:
-                    logger.error(f"Spotify search: {await resp.text()}")
-                    return []
-                data = await resp.json()
-                results = []
-                for item in data.get("tracks", {}).get("items", []):
-                    if not item:
-                        continue
-                    artists = ", ".join(a["name"] for a in item.get("artists", [])) or "Unknown"
-                    album = item.get("album") or {}
-                    album_type = (album.get("album_type") or "single").lower()
-                    total_tracks = album.get("total_tracks") or 1
-                    images = album.get("images") or []
-                    cover = images[0]["url"] if images else None
-                    # альбом / EP, не сингл
-                    is_album_or_ep = album_type == "album" or (
-                        album_type == "single" and total_tracks >= 4
-                    )
-                    results.append({
-                        "title": item.get("name") or "Unknown",
-                        "artists": artists,
-                        "id": item.get("id"),
-                        "duration": item.get("duration_ms") or 0,
-                        "source": "spotify",
-                        "cover": cover,
-                        "album_id": album.get("id") if is_album_or_ep else None,
-                        "album_title": album.get("name") if is_album_or_ep else None,
-                    })
-                return results
+        search = ym_client.search(query, type_="track")
+        if not search or not search.tracks or not search.tracks.results:
+            return []
+        results = []
+        for track in search.tracks.results[:limit]:
+            duration = getattr(track, "duration_ms", 0) or 0
+            if duration and duration < 25000:
+                continue
+            artists = ", ".join(a.name for a in track.artists) if track.artists else "Unknown"
+            album_id = album_title = cover = None
+            try:
+                if track.albums:
+                    al = track.albums[0]
+                    tc = getattr(al, "track_count", None) or getattr(al, "trackCount", None) or 2
+                    if int(tc) > 1:
+                        album_id = str(al.id)
+                        album_title = al.title
+                    if al.cover_uri:
+                        cover = "https://" + al.cover_uri.replace("%%", "400x400")
+            except Exception:
+                pass
+            try:
+                if not cover and getattr(track, "cover_uri", None):
+                    cover = "https://" + track.cover_uri.replace("%%", "400x400")
+            except Exception:
+                pass
+            results.append({
+                "title": track.title or "Unknown",
+                "artists": artists,
+                "id": str(track.id),
+                "album_id": album_id,
+                "album_title": album_title,
+                "duration": duration,
+                "source": "yandex",
+                "cover": cover,
+            })
+        return results
     except Exception as e:
-        logger.error(f"Spotify search failed: {e}")
+        logger.error(f"YM search: {e}")
         return []
 
-async def get_spotify_album(album_id: str) -> dict | None:
-    token = await get_spotify_token()
-    if not token or not album_id:
+async def download_yandex(track_id: str, album_id=None) -> tuple[str | None, str, str]:
+    if not ym_client:
+        return None, "", ""
+    title, artists = "Unknown", "Unknown"
+    path = os.path.join(tempfile.gettempdir(), f"ym_{track_id}.mp3")
+    try:
+        tracks = ym_client.tracks([track_id])
+        if not tracks:
+            return None, title, artists
+        track = tracks[0]
+        title = track.title or "Unknown"
+        artists = ", ".join(a.name for a in track.artists) if track.artists else "Unknown"
+        try:
+            infos = track.get_download_info(get_direct_links=True)
+            if infos:
+                for info in sorted(
+                    infos,
+                    key=lambda x: (0 if (x.codec or "").lower() == "mp3" else 1, -(x.bitrate_in_kbps or 0)),
+                ):
+                    try:
+                        info.download(path)
+                        if os.path.exists(path) and os.path.getsize(path) > 1000:
+                            return path, title, artists
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        for codec, br in [("mp3", 192), ("mp3", 128), ("aac", 192)]:
+            try:
+                track.download(path, codec=codec, bitrate_in_kbps=br)
+                if os.path.exists(path) and os.path.getsize(path) > 1000:
+                    return path, title, artists
+            except Exception:
+                pass
+        return None, title, artists
+    except Exception as e:
+        logger.error(f"YM download: {e}")
+        return None, title, artists
+
+async def get_yandex_album(album_id: str):
+    if not ym_client:
         return None
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                f"https://api.spotify.com/v1/albums/{album_id}",
-                headers={"Authorization": f"Bearer {token}"},
-            ) as resp:
-                if resp.status != 200:
-                    return None
-                album = await resp.json()
-                album_type = (album.get("album_type") or "").lower()
-                total_tracks = album.get("total_tracks") or 0
-                if album_type == "single" and total_tracks < 4:
-                    return None
-
-                artists = ", ".join(a["name"] for a in album.get("artists", []))
-                images = album.get("images") or []
-                cover = images[0]["url"] if images else None
-                tracks = []
-                for t in (album.get("tracks") or {}).get("items", []):
-                    t_artists = ", ".join(a["name"] for a in t.get("artists", [])) or artists
-                    tracks.append({
-                        "title": t.get("name") or "Unknown",
-                        "artists": t_artists,
-                        "id": t.get("id"),
-                        "duration": t.get("duration_ms") or 0,
-                        "source": "spotify",
-                        "cover": cover,
-                        "album_id": album_id,
-                        "album_title": album.get("name"),
-                    })
-                return {
-                    "id": album_id,
-                    "title": album.get("name") or "Album",
-                    "artists": artists,
+        album = ym_client.albums_with_tracks(album_id)
+        if not album:
+            return None
+        title = album.title or "Album"
+        artists = ", ".join(a.name for a in album.artists) if album.artists else ""
+        cover = None
+        try:
+            if album.cover_uri:
+                cover = "https://" + album.cover_uri.replace("%%", "400x400")
+        except Exception:
+            pass
+        tracks = []
+        for vol in (album.volumes or []):
+            for t in vol:
+                if not t:
+                    continue
+                t_artists = ", ".join(a.name for a in t.artists) if t.artists else artists
+                tracks.append({
+                    "id": str(t.id),
+                    "title": t.title or "Unknown",
+                    "artists": t_artists,
+                    "duration": getattr(t, "duration_ms", 0) or 0,
+                    "album_id": str(album_id),
+                    "album_title": title,
+                    "source": "yandex",
                     "cover": cover,
-                    "tracks": tracks,
-                }
+                })
+        if len(tracks) <= 1:
+            return None
+        return {
+            "id": str(album_id),
+            "title": title,
+            "artists": artists,
+            "cover": cover,
+            "tracks": tracks,
+        }
     except Exception as e:
-        logger.error(f"Spotify album: {e}")
+        logger.error(f"YM album: {e}")
         return None
 
 # ===================== YOUTUBE =====================
@@ -195,6 +234,9 @@ async def search_youtube(query: str, limit: int = 10):
                     video_id = entry.get("id")
                     if not video_id:
                         continue
+                    title = entry.get("title") or "Unknown"
+                    if JUNK_RE.search(title):
+                        continue
                     duration = entry.get("duration")
                     if duration and duration > 900:
                         continue
@@ -202,7 +244,7 @@ async def search_youtube(query: str, limit: int = 10):
                     if entry.get("thumbnails"):
                         thumb = entry["thumbnails"][-1].get("url") or thumb
                     results.append({
-                        "title": entry.get("title") or "Unknown",
+                        "title": title,
                         "artists": entry.get("uploader") or entry.get("channel") or "YouTube",
                         "url": entry.get("webpage_url") or f"https://www.youtube.com/watch?v={video_id}",
                         "id": str(video_id),
@@ -277,12 +319,15 @@ async def search_soundcloud(query: str, limit: int = 8):
                     url = entry.get("webpage_url") or entry.get("url")
                     if not url:
                         continue
+                    title = entry.get("title") or "Unknown"
+                    if JUNK_RE.search(title):
+                        continue
                     duration = entry.get("duration")
                     thumb = None
                     if entry.get("thumbnails"):
                         thumb = entry["thumbnails"][-1].get("url")
                     results.append({
-                        "title": entry.get("title") or "Unknown",
+                        "title": title,
                         "artists": entry.get("uploader") or "Unknown",
                         "url": url,
                         "id": str(entry.get("id", "")),
@@ -339,92 +384,6 @@ async def download_soundcloud(url: str) -> tuple[str | None, str, str]:
         logger.error(f"SC download: {e}")
     return None, title, artists
 
-# ===================== YANDEX =====================
-
-async def search_yandex(query: str, limit: int = 12):
-    if not ym_client:
-        return []
-    try:
-        search = ym_client.search(query, type_="track")
-        if not search or not search.tracks or not search.tracks.results:
-            return []
-        results = []
-        for track in search.tracks.results[:limit]:
-            duration = getattr(track, "duration_ms", 0) or 0
-            if duration and duration < 25000:
-                continue
-            artists = ", ".join(a.name for a in track.artists) if track.artists else "Unknown"
-            album_id = album_title = cover = None
-            try:
-                if track.albums:
-                    al = track.albums[0]
-                    tc = getattr(al, "track_count", None) or 2
-                    if int(tc) > 1:
-                        album_id = str(al.id)
-                        album_title = al.title
-                    if al.cover_uri:
-                        cover = "https://" + al.cover_uri.replace("%%", "400x400")
-            except Exception:
-                pass
-            try:
-                if not cover and getattr(track, "cover_uri", None):
-                    cover = "https://" + track.cover_uri.replace("%%", "400x400")
-            except Exception:
-                pass
-            results.append({
-                "title": track.title or "Unknown",
-                "artists": artists,
-                "id": str(track.id),
-                "album_id": album_id,
-                "album_title": album_title,
-                "duration": duration,
-                "source": "yandex",
-                "cover": cover,
-            })
-        return results
-    except Exception as e:
-        logger.error(f"YM search: {e}")
-        return []
-
-async def download_yandex(track_id: str, album_id=None) -> tuple[str | None, str, str]:
-    if not ym_client:
-        return None, "", ""
-    title, artists = "Unknown", "Unknown"
-    path = os.path.join(tempfile.gettempdir(), f"ym_{track_id}.mp3")
-    try:
-        tracks = ym_client.tracks([track_id])
-        if not tracks:
-            return None, title, artists
-        track = tracks[0]
-        title = track.title or "Unknown"
-        artists = ", ".join(a.name for a in track.artists) if track.artists else "Unknown"
-        try:
-            infos = track.get_download_info(get_direct_links=True)
-            if infos:
-                for info in sorted(
-                    infos,
-                    key=lambda x: (0 if (x.codec or "").lower() == "mp3" else 1, -(x.bitrate_in_kbps or 0)),
-                ):
-                    try:
-                        info.download(path)
-                        if os.path.exists(path) and os.path.getsize(path) > 1000:
-                            return path, title, artists
-                    except Exception:
-                        pass
-        except Exception:
-            pass
-        for codec, br in [("mp3", 192), ("mp3", 128), ("aac", 192)]:
-            try:
-                track.download(path, codec=codec, bitrate_in_kbps=br)
-                if os.path.exists(path) and os.path.getsize(path) > 1000:
-                    return path, title, artists
-            except Exception:
-                pass
-        return None, title, artists
-    except Exception as e:
-        logger.error(f"YM download: {e}")
-        return None, title, artists
-
 # ===================== CORE =====================
 
 async def fetch_cover_bytes(url: str) -> bytes | None:
@@ -442,22 +401,29 @@ async def fetch_cover_bytes(url: str) -> bytes | None:
     return None
 
 async def download_by_track(track: dict) -> tuple[str | None, str, str]:
-    """Аудио: YouTube → SoundCloud → Яндекс (Spotify = метаданные)"""
     prefer_title = track.get("title") or "Unknown"
     prefer_artists = track.get("artists") or "Unknown"
     source = track.get("source")
     path = None
     q = f"{prefer_artists} {prefer_title}".strip()
 
-    if source == "youtube" and track.get("url"):
+    if source == "yandex" and track.get("id"):
+        path, _, _ = await download_yandex(track["id"], track.get("album_id"))
+    elif source == "youtube" and track.get("url"):
         path, _, _ = await download_youtube(track["url"])
     elif source == "soundcloud" and track.get("url"):
         path, _, _ = await download_soundcloud(track["url"])
-    elif source == "yandex" and track.get("id"):
-        path, _, _ = await download_yandex(track["id"], track.get("album_id"))
 
     if path:
         return path, prefer_title, prefer_artists
+
+    # fallback
+    if source != "yandex":
+        ym = await search_yandex(q)
+        for item in ym[:3]:
+            path, _, _ = await download_yandex(item["id"], item.get("album_id"))
+            if path:
+                return path, prefer_title, prefer_artists
 
     yt = await search_youtube(q)
     for item in yt[:4]:
@@ -468,12 +434,6 @@ async def download_by_track(track: dict) -> tuple[str | None, str, str]:
     sc = await search_soundcloud(q)
     for item in sc[:3]:
         path, _, _ = await download_soundcloud(item["url"])
-        if path:
-            return path, prefer_title, prefer_artists
-
-    ym = await search_yandex(q)
-    for item in ym[:3]:
-        path, _, _ = await download_yandex(item["id"], item.get("album_id"))
         if path:
             return path, prefer_title, prefer_artists
 
@@ -542,12 +502,10 @@ def build_page(user_id: int, page: int):
         title = track["title"]
         artists = track["artists"]
 
-        if track["source"] == "spotify":
-            payload = f"s{user_id}_{global_index}"
+        if track["source"] == "yandex":
+            payload = f"y{track['id']}"
         elif track["source"] == "youtube":
             payload = f"t{track['id']}"
-        elif track["source"] == "yandex":
-            payload = f"y{track['id']}"
         else:
             payload = f"x{user_id}_{global_index}"
 
@@ -581,7 +539,50 @@ async def cmd_start(message: Message):
     args = message.text.split(maxsplit=1)
     payload = args[1].strip() if len(args) > 1 else ""
 
-    if payload.startswith("s") or payload.startswith("x"):
+    if payload.startswith("y") and payload[1:].isdigit():
+        track_id = payload[1:]
+        status = await message.answer("Скачиваю…")
+        path, title, artists = await download_yandex(track_id)
+        album_id = album_title = cover = None
+        try:
+            if ym_client:
+                tracks = ym_client.tracks([track_id])
+                if tracks and tracks[0].albums:
+                    al = tracks[0].albums[0]
+                    tc = getattr(al, "track_count", None) or 2
+                    if int(tc) > 1:
+                        album_id = str(al.id)
+                        album_title = al.title
+                    if al.cover_uri:
+                        cover = "https://" + al.cover_uri.replace("%%", "400x400")
+        except Exception:
+            pass
+        if not path:
+            path, title, artists = await download_by_track({
+                "title": title, "artists": artists, "source": "yandex", "id": track_id
+            })
+        if path:
+            await status.delete()
+            await send_track(message, path, title, artists, cover, album_id, album_title)
+        else:
+            await status.edit_text("Не удалось скачать трек")
+        return
+
+    if payload.startswith("t") and len(payload) > 1:
+        status = await message.answer("Скачиваю…")
+        vid = payload[1:]
+        path, title, artists = await download_youtube(f"https://www.youtube.com/watch?v={vid}")
+        if path:
+            await status.delete()
+            await send_track(
+                message, path, title, artists,
+                cover_url=f"https://img.youtube.com/vi/{vid}/hqdefault.jpg",
+            )
+        else:
+            await status.edit_text("Не удалось скачать трек")
+        return
+
+    if payload.startswith("x"):
         try:
             rest = payload[1:]
             user_id_str, idx_str = rest.split("_", 1)
@@ -607,30 +608,6 @@ async def cmd_start(message: Message):
         except Exception as e:
             logger.error(e)
             await message.answer("Ошибка. Поищи заново")
-        return
-
-    if payload.startswith("t") and len(payload) > 1:
-        status = await message.answer("Скачиваю…")
-        vid = payload[1:]
-        path, title, artists = await download_youtube(f"https://www.youtube.com/watch?v={vid}")
-        if path:
-            await status.delete()
-            await send_track(
-                message, path, title, artists,
-                cover_url=f"https://img.youtube.com/vi/{vid}/hqdefault.jpg",
-            )
-        else:
-            await status.edit_text("Не удалось скачать трек")
-        return
-
-    if payload.startswith("y") and payload[1:].isdigit():
-        status = await message.answer("Скачиваю…")
-        path, title, artists = await download_yandex(payload[1:])
-        if path:
-            await status.delete()
-            await send_track(message, path, title, artists)
-        else:
-            await status.edit_text("Не удалось скачать трек")
         return
 
     await message.answer(
@@ -678,13 +655,12 @@ async def handle_query(message: Message):
 
     status = await message.answer("w8^*^")
 
-    # Spotify → YouTube → SoundCloud → Яндекс
-    sp = await search_spotify(query)
+    # Яндекс → YouTube → SoundCloud
+    ym = await search_yandex(query)
     yt = await search_youtube(query)
     sc = await search_soundcloud(query)
-    ym = await search_yandex(query)
 
-    all_results = sp + yt + sc + ym
+    all_results = rank_results(ym + yt + sc, query)
     if not all_results:
         await status.edit_text("Ничего не найдено")
         return
@@ -731,9 +707,9 @@ async def on_album(callback: CallbackQuery):
     await callback.answer()
     status = await callback.message.answer("Загружаю альбом…")
 
-    info = await get_spotify_album(album_id)
+    info = await get_yandex_album(album_id)
     if not info or not info["tracks"]:
-        await status.edit_text("Не удалось загрузить альбом (или это сингл)")
+        await status.edit_text("Не удалось загрузить альбом")
         return
 
     user_id = callback.from_user.id
@@ -742,19 +718,14 @@ async def on_album(callback: CallbackQuery):
     header = f"<b>{info['artists']}</b> — <b>{info['title']}</b>\n"
     lines = [header]
     for i, t in enumerate(info["tracks"][:30]):
-        lines.append(f"{i + 1}. {t['title']}")
+        lines.append(
+            f"{i + 1}. <a href=\"https://t.me/{BOT_USERNAME}?start=y{t['id']}\">{t['title']}</a>"
+        )
 
     text = "\n".join(lines)
-    buttons = []
-    for i, t in enumerate(info["tracks"][:20]):
-        btn = f"{i + 1}. {t['title']}"
-        if len(btn) > 60:
-            btn = btn[:57] + "…"
-        buttons.append([InlineKeyboardButton(text=btn, callback_data=f"adl:{user_id}:{i}")])
-    buttons.append([
-        InlineKeyboardButton(text="📥 Скачать весь альбом", callback_data=f"adlall:{user_id}")
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📥 Скачать весь альбом", callback_data=f"adlall:{user_id}")]
     ])
-    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
 
     try:
         await status.delete()
@@ -773,37 +744,9 @@ async def on_album(callback: CallbackQuery):
         except Exception as e:
             logger.warning(f"cover: {e}")
 
-    await callback.message.answer(text, parse_mode=ParseMode.HTML, reply_markup=kb)
-
-@dp.callback_query(F.data.startswith("adl:"))
-async def on_album_track(callback: CallbackQuery):
-    try:
-        _, uid, idx = callback.data.split(":")
-        user_id, index = int(uid), int(idx)
-    except Exception:
-        await callback.answer("Ошибка", show_alert=True)
-        return
-    if callback.from_user.id != user_id:
-        await callback.answer("Не твой альбом", show_alert=True)
-        return
-    info = album_cache.get(user_id)
-    if not info or index >= len(info["tracks"]):
-        await callback.answer("Устарело", show_alert=True)
-        return
-    track = info["tracks"][index]
-    await callback.answer()
-    status = await callback.message.answer(f"Скачиваю «{track['title']}»…")
-    path, title, artists = await download_by_track(track)
-    if path:
-        await status.delete()
-        await send_track(
-            callback.message, path, title, artists,
-            cover_url=track.get("cover") or info.get("cover"),
-            album_id=track.get("album_id"),
-            album_title=track.get("album_title"),
-        )
-    else:
-        await status.edit_text("Не удалось скачать")
+    await callback.message.answer(
+        text, parse_mode=ParseMode.HTML, reply_markup=kb, disable_web_page_preview=True
+    )
 
 @dp.callback_query(F.data.startswith("adlall:"))
 async def on_album_all(callback: CallbackQuery):
